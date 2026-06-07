@@ -3,6 +3,9 @@
 #include <Wire.h> //for I2C
 #include <Adafruit_MPU6050.h> //for MPU6050 IMU sensor
 #include <Adafruit_Sensor.h> //for Adafruit sensor library, used by MPU6050 library
+#include <math.h> 
+#include <rmw_microros/rmw_microros.h> //timestamping
+#include <rosidl_runtime_c/string_functions.h> //to set frame_id
 
 #include <rcl/rcl.h> //ROS CLIENT LIBRARY
 //rcl specific header, must be included after microros_platformio.h
@@ -58,21 +61,32 @@ void error_loop() {
   (void)temp_rc; \
 }
 
+void set_orientation_from_rpy(float roll, float pitch, float yaw) { //quarternion function, converts roll, pithc, yaw
+  float cy = cos(yaw * 0.5);
+  float sy = sin(yaw * 0.5);
+  float cp = cos(pitch * 0.5);
+  float sp = sin(pitch * 0.5);
+  float cr = cos(roll * 0.5);
+  float sr = sin(roll * 0.5);
+
+  imu_msg.orientation.w = cr * cp * cy + sr * sp * sy;
+  imu_msg.orientation.x = sr * cp * cy - cr * sp * sy;
+  imu_msg.orientation.y = cr * sp * cy + sr * cp * sy;
+  imu_msg.orientation.z = cr * cp * sy - sr * sp * cy;
+}
 
 void setup() {
   Serial.begin(115200);
-  sensor_msgs__msg__Imu__init(&imu_msg); //initialize object imu_msg, do not assume header files are zeroed out
-  imu_msg.orientation_covariance[0] = -1; 
+  delay(1000);
+
+  set_microros_serial_transports(Serial); //sets transport layer to use USB serial
 
   Wire.begin(IMU_SDA_PIN, IMU_SCL_PIN); //sda first, scl second
 
   if (!mpu.begin(MPU6050_ADDR)) {
-    Serial.println("MPU6050 i2c initialization failed!");
     error_loop();
   }
-  delay(1000);
 
-  set_microros_serial_transports(Serial); //sets transport layer to use USB serial
   allocator = rcl_get_default_allocator(); //choose memory allocator
 
   rclc_support_init(&support, 0, NULL, &allocator); //should RCCHECK THIS
@@ -92,6 +106,15 @@ void setup() {
   //&publisher pointer to publisher object, &node so publisher can reference node
   //creates ROS topic /imu/data, with message type sensor_msgs/msg/Imu, should RCCHECK THIS
 
+  sensor_msgs__msg__Imu__init(&imu_msg); //initialize object imu_msg, do not assume header files are zeroed out
+  rosidl_runtime_c__String__assign(&imu_msg.header.frame_id, "imu_link"); //sets coordinate frame of imu msg
+
+  // Sync ESP32 time with the micro-ROS Agent
+  rmw_uros_sync_session(1000);
+
+  imu_msg.orientation_covariance[0] = 0.05;
+  imu_msg.orientation_covariance[4] = 0.05;
+  imu_msg.orientation_covariance[8] = 999;
 
 }
 
@@ -108,6 +131,12 @@ void loop() {
   float gy = gyro.gyro.y; //get y gyro in rad/s
   float gz = gyro.gyro.z; //get z gyro in rad/s
 
+  float roll = atan2(ay, az);
+  float pitch = atan2(-ax, sqrt(ay * ay + az * az));
+  float yaw = 0.0;
+
+  set_orientation_from_rpy(roll, pitch, yaw);
+
   //so that node /esp32_node can send ROS messages to topic /imu/data and publish it
   imu_msg.linear_acceleration.x = ax; //fill imu message with accel data
   imu_msg.linear_acceleration.y = ay; 
@@ -115,6 +144,11 @@ void loop() {
   imu_msg.angular_velocity.x = gx; //fill imu message with gyro data
   imu_msg.angular_velocity.y = gy;
   imu_msg.angular_velocity.z = gz;
+
+  int64_t time_ns = rmw_uros_epoch_nanos();
+  imu_msg.header.stamp.sec = time_ns / 1000000000;
+  imu_msg.header.stamp.nanosec = time_ns % 1000000000;
+
   rcl_publish(&publisher, &imu_msg, NULL);
   delay(50);
 }
